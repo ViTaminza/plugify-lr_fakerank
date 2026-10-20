@@ -1,0 +1,28 @@
+{
+	"$schema": "https://raw.githubusercontent.com/untrustedmodders/plugify/refs/heads/main/schemas/plugin.schema.json",
+	"version": "${LR_FAKERANK_VERSION}",
+	"name": "lr_fakerank",
+	"description": "[LR] FakeRank: shows the Levels Ranks rank (and a fake win count) in the scoreboard by writing the controller's competitive fields from <configs>/levels_ranks/fakerank.ini (rank type 0-4, LR rank -> Tab rank table) and sending CCSUsrMsg_ServerRankRevealAll when a player presses Tab; mm_fakerank_reveal (0/1/2) and mm_reload_fakerank control it. Ported from the Pisex Levels Ranks module LR_FakeRanks. Requires the levels_ranks core; no exported methods.",
+	"author": "Pisex, ported to Plugify",
+	"website": "https://github.com/untrustedmodders/plugify",
+	"license": "GPL-3.0",
+	"entry": "bin/lr_fakerank",
+	"platforms": [],
+	"language": "cpp",
+	"dependencies": [
+		{
+			"name": "s2sdk",
+			"constraints": ">=2.18.2"
+		},
+		{
+			"name": "levels_ranks",
+			"constraints": ">=1.0.0"
+		},
+		{
+			"name": "hudmenu",
+			"constraints": ">=1.0.0",
+			"optional": true
+		}
+	],
+	"methods": []
+}
