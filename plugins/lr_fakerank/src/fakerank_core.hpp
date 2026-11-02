@@ -1,18 +1,22 @@
 #pragma once
 // Engine-free core of the lr_fakerank port (the Pisex LR module "[LR] FakeRank", the original's
-// lr_fakerank.cpp): the fakerank.ini model (the "Type" switch and the "FakeRank" table), the
-// values the GameFrame hook writes into the controller's competitive fields, and the Tab/reveal
-// state machine (iOldButtons / g_bRevealed).
+// lr_fakerank.cpp): the fakerank.ini reader/model (the "Type" switch and the "FakeRank" table), the
+// values the per-frame tick writes into the controller's competitive fields, the Tab/reveal state
+// machine (iOldButtons / g_bRevealed) and the map-gated schema-offset cache.
 //
-// The engine side (the per-frame tick, the schema field writes, the usermessage, the cvar and the
-// command) lives in src/plugin.cpp; everything here is testable.
+// Self-contained on purpose (docs/PLUGIN_STANDARD.md §7: no pisexcompat, no helper library): the
+// config is read by the KV1 reader below, which accepts exactly the grammar the original's
+// KeyValues parser did. The engine side (every s2sdk call) lives in src/plugin.cpp; everything here
+// is testable without a server.
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
-
-#include <pisex/keyvalues.hpp>
+#include <string_view>
+#include <vector>
 
 namespace lr_fakerank {
 
@@ -33,6 +37,67 @@ inline constexpr int kRevealNever = 0;       // 0: never send the reveal
 inline constexpr int kRevealEveryPress = 1;  // 1: on every Tab press (the original behaviour)
 inline constexpr int kRevealOncePerMap = 2;  // 2: on the first Tab press per player and map
 
+// --- the KV1 reader (the original loaded the file through KeyValues) -----------------------------
+
+// The production config is the original Metamod file, unchanged (PLUGIN_STANDARD §7: production
+// KeyValues files are read as they are, no conversion):
+//
+//     "LR_FakeRank"
+//     {
+//         // 0 - обычные ранги ...
+//         "Type"      "0"
+//         "FakeRank"
+//         {
+//             "1"     "1"
+//             "2"     "2"
+//         }
+//     }
+//
+// The grammar is the one the original's KeyValues accepted: quoted ("key" "value") and unquoted
+// tokens, a key may carry a value and a block, nested blocks, // and /* */ comments, \" \\ \n \r \t
+// escapes inside quotes, and #base / #include / #define lines are skipped instead of followed. A
+// UTF-8 BOM is ignored (the production file carries one). A malformed file - an unterminated
+// string or comment, a missing '}' or a stray top-level '}' - is rejected as a whole
+// (std::nullopt), so half a table is never applied.
+//
+// Like Valve's loader, a file that is a single "Root" { ... } block is returned as that block, so
+// `LoadKv1File(...)->GetInt("Type")` reads the key inside "LR_FakeRank" { ... }. Key lookup is
+// case-insensitive.
+struct KvNode {
+	std::string name;
+	std::string value;
+	bool hasValue = false;
+	std::vector<KvNode> children;
+
+	// First child with that name (case-insensitive, like Valve's FindKey), or nullptr.
+	const KvNode* Find(std::string_view key) const;
+	// The child's value; `def` when the child is missing or has no value.
+	std::string_view GetString(std::string_view key, std::string_view def = {}) const;
+	// The child's value as an int, with Valve's atoi fallback ("5x" -> 5, "abc" -> 0); `def` when
+	// the child is missing or its value is empty (KeyValues::GetInt(key, def)).
+	int GetInt(std::string_view key, int def = 0) const;
+	// This node's own value as an int (the original's value->GetInt(nullptr) in the rank loop).
+	int IntValue() const;
+};
+
+std::optional<KvNode> ParseKv1(std::string_view text);
+std::optional<KvNode> LoadKv1File(const std::string& path);
+
+// --- where the file is read from -----------------------------------------------------------------
+
+// The Pisex LR installation keeps every module's config in one directory; the plugin's own folder
+// (PLUGIN_STANDARD §3) is the fallback for a clean Plugify install.
+inline constexpr std::string_view kLevelsRanksDir = "levels_ranks";
+inline constexpr std::string_view kPluginDir = "lr_fakerank";
+inline constexpr std::string_view kConfigFile = "fakerank.ini";
+
+std::string JoinPath(std::string_view base, std::string_view name);
+bool FileExists(const std::string& path);
+
+// <configsDir>/levels_ranks/fakerank.ini, then <configsDir>/lr_fakerank/fakerank.ini. Empty when
+// |configsDir| is empty (the host did not supply plg::GetConfigsDir()).
+std::vector<std::string> ConfigCandidates(std::string_view configsDir);
+
 // --- the configuration (g_iType + g_Ranks) -------------------------------------------------------
 
 struct Config {
@@ -46,10 +111,25 @@ struct Config {
 	int RankFor(int rank) const;
 };
 
+// The outcome of LoadConfig(): what was read and what was wrong with it.
+struct ConfigSource {
+	bool loaded = false;    // a candidate file was found and parsed into the Config
+	std::string path;       // the file that was read (empty when no candidate existed)
+	std::string error;      // why nothing was loaded (empty when |loaded| is true)
+	std::string problem;    // non-fatal parse note: a FakeRank key that is not a rank number
+};
+
+// Tries ConfigCandidates() in order and parses the first file that exists into |out|. The first
+// existing file is authoritative: a malformed one is reported through |error| instead of silently
+// falling back (a half-broken primary config must not be masked by an old copy). |out| is only
+// modified when a file was parsed (ParseConfig clears the rank table first); the caller keeps its
+// previous state otherwise.
+ConfigSource LoadConfig(std::string_view configsDir, Config& out);
+
 // LoadConfig() of the original: the "Type" switch and the FOR_EACH_VALUE loop over "FakeRank".
 // The rank table is cleared first (g_Ranks.clear()); a key that is not a number is skipped (the
 // original's std::stoi would have thrown); |problem| gets a message when that happens.
-void ParseConfig(const pisex::KeyValues& kv, Config& out, std::string* problem = nullptr);
+void ParseConfig(const KvNode& root, Config& out, std::string* problem = nullptr);
 
 // --- the controller fields (the GameFrame body) ---------------------------------------------------
 
@@ -65,20 +145,35 @@ struct Desired {
 //   anything else: the tab rank of the LR rank, the configured type.
 Desired ComputeDesired(const Config& config, int lr_rank, int lr_exp);
 
-// --- the schema offset lookups (the plugin's FieldOffset) -----------------------------------------
+// --- the schema offset lookups (the plugin's map-gated SchemaOffset) -----------------------------
 
-// One controller-field offset: kOffsetUnresolved until a lookup answers, the resolved offset, or
-// kOffsetFailed once a lookup missed with the game up. The schema system loads with the map, so
-// that miss is permanent; the plugin latches it because retrying every frame would make s2sdk
-// print its "'X' was not found in 'Y'" warning on every call (hundreds of lines per second for a
-// renamed field).
-inline constexpr int kOffsetUnresolved = -1;
-inline constexpr int kOffsetFailed = -2;
+// The map-gated schema-offset cache (PITFALLS C8). s2sdk's GetSchemaOffset builds its field list
+// from the network serializer map, which does not exist before the first map: a lookup from
+// OnPluginStart segfaults. Offset() therefore refuses to ask while the plugin's map gate is closed
+// and memoises only successful results (offset >= 0): a miss is retried on the next call instead of
+// poisoning the field for the session (the game build may simply not have the map up yet, and a
+// wrong caching of -1 would hide a field that appears later).
+//
+// The lookup is injected as a function pointer so the tests can drive the whole policy (gate first,
+// successes memoised, failures retried) without an engine.
+class SchemaOffsetCache {
+public:
+	// Both return -1 for "unknown".
+	using OffsetLookup = int32_t (*)(const char* className, const char* fieldName);
 
-// The FieldOffset decision, engine-free: |found| is this frame's pisex::SchemaOffset answer (>= 0
-// the offset, < 0 the miss) and |game_ready| is pisex::IsGameReady(). Updates |state| and returns
-// true when the miss was newly latched - the caller logs the one-time error then.
-bool RecordOffsetLookup(int& state, int found, bool game_ready);
+	// >= 0 offset of className::fieldName, or -1 when no map is up / the field is unknown / an
+	// empty name or no lookup was supplied. A cached hit never calls |lookup|.
+	int32_t Offset(bool mapReady, const char* className, const char* fieldName, OffsetLookup lookup);
+
+	// Forgets everything; the plugin calls this in OnPluginEnd (a reload re-resolves the fields).
+	void Clear() { m_offsets.clear(); }
+
+	// Bookkeeping for the tests.
+	std::size_t CachedCount() const { return m_offsets.size(); }
+
+private:
+	std::map<std::string, int32_t> m_offsets; // class + '\0' + field -> offset >= 0
+};
 
 // --- the Tab/reveal state (iOldButtons / g_bRevealed) ---------------------------------------------
 
